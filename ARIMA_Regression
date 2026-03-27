@@ -10,6 +10,22 @@ from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.arima.model import ARIMA
 from sklearn.metrics import mean_squared_error
 from pmdarima.arima import auto_arima
+import os
+
+os.makedirs("plots/flows", exist_ok=True)
+os.makedirs("plots/stocks", exist_ok=True)
+os.makedirs("plots/growth", exist_ok=True)
+os.makedirs("plots/networks/full", exist_ok=True)
+os.makedirs("plots/networks/top10", exist_ok=True)
+os.makedirs("plots/forecast/network_fit", exist_ok=True)
+os.makedirs("plots/forecast/arima_fit", exist_ok=True)
+os.makedirs("plots/forecast/comparison", exist_ok=True)
+os.makedirs("plots/forecast/comparison_panel", exist_ok=True)
+os.makedirs("plots/forecast/extended", exist_ok=True)
+os.makedirs("plots/forecast/extended_panel", exist_ok=True)
+os.makedirs("plots/marginal_effects", exist_ok=True)
+os.makedirs("plots/analysis", exist_ok=True)
+os.makedirs("tables", exist_ok=True)
 
 # Dictionary with technology names and corresponding file paths
 technologies = {
@@ -86,7 +102,7 @@ for technology, file_path in technologies.items():
     all_years = all_years.merge(flows, on='Früheste Priorität', how='left').fillna(0)
     
     # Replace stocks for years with 0 flows by carrying forward the previous year's stock
-    all_years['count'] = all_years['count'].ffill()
+    all_years['count'] = all_years['count'].fillna(0)
     
     # Now, calculate the cumulative stock after filling missing years
     all_years['Stock'] = all_years['count'].cumsum()
@@ -112,7 +128,7 @@ for technology, file_path in technologies.items():
     plt.ylabel('Number of patent families (Flows)')
     plt.grid()
     plt.legend()
-    flows_plot_file = f'flows_{technology}.png'
+    flows_plot_file = f'plots/flows/flows_{technology}.png'
     plt.savefig(flows_plot_file, dpi=300)
     plt.close()
 
@@ -125,7 +141,7 @@ for technology, file_path in technologies.items():
     plt.ylabel('Cumulative Number of patent families')
     plt.grid()
     plt.legend()
-    stocks_plot_file = f'stocks_{technology}.png'
+    stocks_plot_file = f'plots/stocks/stocks_{technology}.png'
     plt.savefig(stocks_plot_file, dpi=300)
     plt.close()
 
@@ -246,7 +262,7 @@ for technology, file_path in technologies.items():
     # Final plot settings
     plt.axis('off')
     plt.title('Citation Network for ' + technology)
-    output_file = f'normalized_citation_network_{technology}_{max_priority_year}.png'
+    output_file = f'plots/networks/full/normalized_citation_network_{technology}_{max_priority_year}.png'
     plt.savefig(output_file, format='png', dpi=300)
     plt.close()
 
@@ -291,7 +307,7 @@ for technology, file_path in technologies.items():
 
     plt.axis('off')
     plt.title('Top 10 Cited Technologies Network for ' + technology)
-    output_file_h = f'top_10_cited_network_{technology}_{max_priority_year}.png'
+    output_file_h = f'plots/networks/top10/top_10_cited_network_{technology}_{max_priority_year}.png'
     plt.savefig(output_file_h, format='png', dpi=300)
     plt.close()
 
@@ -391,7 +407,7 @@ for technology, file_path in technologies.items():
 
     # Calculate the growth rate for each class
     if logs==1:
-        growth_data_classes['Growth_Rate'] = np.log((growth_data_classes['Stock_End_Year'] - growth_data_classes['Stock_Start_Year']) / growth_data_classes['Stock_Start_Year'])
+        growth_data_classes['Growth_Rate'] = np.log(growth_data_classes['Stock_End_Year'] / growth_data_classes['Stock_Start_Year'])
         
     else:    
         growth_data_classes['Growth_Rate'] = (growth_data_classes['Stock_End_Year'] - growth_data_classes['Stock_Start_Year']) / growth_data_classes['Stock_Start_Year']
@@ -412,7 +428,7 @@ for technology, file_path in technologies.items():
     end_year_stock_technology = all_years[all_years['Früheste Priorität'] == end_year]['Stock'].values[0]
 
     # Calculate growth
-    growth_technology = np.log((end_year_stock_technology - start_year_stock_technology) / start_year_stock_technology)
+    growth_technology = np.log((end_year_stock_technology) / start_year_stock_technology)
 
     print(f'The overall growth rate for {technology} is: {growth_technology}')
 
@@ -471,7 +487,7 @@ for technology, file_path in technologies.items():
     plt.grid()
     plt.legend()
     # Save the plot
-    growth_plot_file = f'Growth_{technology}.png'
+    growth_plot_file = f'plots/growth/Growth_{technology}.png'
     plt.savefig(growth_plot_file, dpi=300)
     plt.close()  # Close the plot to avoid display
     """Regression for all available data"""
@@ -599,7 +615,7 @@ print(beta_weighted_cited_classes_growth)
 # LaTeX-output with Stargazer
 stargazer = Stargazer([results_panel])
 print(stargazer.render_latex())
-with open('regression_results_stargazer.tex', 'w') as file:
+with open('tables/regression_results_stargazer.tex', 'w') as file:
     file.write(stargazer.render_latex())
 
 # Show entity effects of panel regression and save them
@@ -735,7 +751,7 @@ for tech in technologies_iter:
 
     stargazer_ols_technology.title(f"Regression Results for storage technology {tech} (individual estimation)")
 
-    with open(f'technology_regression_results_stargazer_{tech}.tex', 'w') as file:
+    with open(f'tables/technology_regression_results_stargazer_{tech}.tex', 'w') as file:
         file.write(stargazer_ols_technology.render_latex())
     # Get the OLS results (Intercept, Beta, R-squared, etc.)
     intercept = results.params['const']
@@ -768,7 +784,8 @@ for tech in technologies_iter:
     plt.xticks(ticks=range(years_cut.min(),years_cut.max()+1,5))
     plt.legend()
     plt.grid(True)
-    plt.savefig(f'NetworkModelComparison_{tech}_{cutoff_training}.png', dpi=300)
+
+    plt.savefig(f'plots/forecast/network_fit/NetworkModelComparison_{tech}_{cutoff_training}.png', dpi=300)
     plt.close()
 
     # Set up test data for comparison
@@ -799,28 +816,26 @@ for tech in technologies_iter:
 
     # Build and fit the ARIMA/ARIMA/AutoARIMA model
 
-    #AutoARIMA
-    model_ARIMA_comparison = auto_arima(y_comparison, start_p=0, start_q=0, seasonal=False)
-    model_fit = model_ARIMA_comparison.fit(y_comparison)
+    model_fit = auto_arima(y_comparison, start_p=0, start_q=0, seasonal=False)
 
-    # Display ARIMA model summary
     print(f"ARIMA model summary for {tech}:\n", model_fit.summary())
-    params = model_fit.params_  # Modellparameter
-    stderr = model_fit.std_err_  # Standardfehler der Schätzwerte
-    pvalues = model_fit.pvalues_  # p-Werte für die Tests der Hypothesen
+    params = model_fit.params()
+    stderr = model_fit.bse()
+    pvalues = model_fit.pvalues()
     
-    # Extrahiere die Modellordnung (p, d, q)
-    order = model_fit.order  # (p, d, q)
-    seasonal_order = model_fit.seasonal_order  # (P, D, Q, m), falls saisonal
+    order = model_fit.order 
+    seasonal_order = model_fit.seasonal_order 
 
-    # Erstelle ein DataFrame für die aktuellen Parameter und ihre Werte
+
+    param_names = model_fit.arima_res_.param_names
+
     tech_results_df = pd.DataFrame({
-        'Parameter': ['Intercept', 'AR1', 'MA1'],  # Beispiel für Parameter
-        'Estimate': params[:3],  # Nimm die ersten 3 Parameter (für AR, MA und Intercept)
-        'Std Error': stderr[:3],  # Entsprechend für Std Error
-        'p-value': pvalues[:3],  # Entsprechend für p-value
-        'Technology': tech,  # Füge die Technologie als Spalte hinzu
-        'ARIMA Order': [order] * 3  # Wiederhole die Order für jedes Parameter
+        'Parameter': param_names,
+        'Estimate': params,
+        'Std Error': stderr,
+        'p-value': pvalues,
+        'Technology': tech,
+        'ARIMA Order': [order] * len(params)
     })
     arima_results_df.append(tech_results_df)
     # Get the fitted values
@@ -834,7 +849,7 @@ for tech in technologies_iter:
     plt.ylabel('Technology Growth')
     plt.xticks(ticks=range(years_cut.min(),years_cut.max()+1,5))
     plt.legend()
-    plt.savefig(f'ARIMA_{tech}_{cutoff_training}_comparison.png', dpi=300)
+    plt.savefig(f'plots/forecast/arima_fit/ARIMA_{tech}_{cutoff_training}_comparison.png', dpi=300)
     plt.close()
 
     # Define future years for plotting
@@ -848,8 +863,6 @@ for tech in technologies_iter:
 
     forecast_steps = end_prediction - start_prediction + 1
     forecast_ARIMA = model_fit.predict(n_periods=forecast_steps)
-
-
 
     # Extract actual values and corresponding years for the entire period
     actual_values = tech_data['Technology_Growth']
@@ -874,7 +887,7 @@ for tech in technologies_iter:
     plt.xticks(ticks=range(actual_years.min(),future_years.max()+1,5))
     plt.legend()
     plt.grid(True)
-    plt.savefig(f'ForecastComparison_{tech}_{cutoff_training}.png', dpi=300)
+    plt.savefig(f'plots/forecast/comparison/ForecastComparison_{tech}_{cutoff_training}.png', dpi=300)
     plt.close()
 
     # Forecast to 2030 for ARIMA
@@ -899,7 +912,7 @@ for tech in technologies_iter:
     plt.xticks(ticks=range(actual_years.min(),future_years_extended.max()+1,5))
     plt.legend()
     plt.grid(True)
-    plt.savefig(f'Extended_NetworkAndARIMA_Forecast_{tech}_{cutoff_training}_to_2030.png', dpi=300)
+    plt.savefig(f'plots/forecast/extended/Extended_NetworkAndARIMA_Forecast_{tech}_{cutoff_training}_to_2030.png', dpi=300)
     plt.close()
 
     # Conditional Forecast using PanelOLS parameters
@@ -950,7 +963,7 @@ for tech in technologies_iter:
     plt.xticks(ticks=range(actual_years.min(),future_years.max()+1,5))
     plt.legend()
     plt.grid(True)
-    plt.savefig(f'ForecastComparison_Panel_{tech}_{cutoff_training}.png', dpi=300)
+    plt.savefig(f'plots/forecast/comparison_panel/ForecastComparison_Panel_{tech}_{cutoff_training}.png', dpi=300)
     plt.close()
 
     # Plotting unconditional panel forecast until 2030
@@ -969,7 +982,7 @@ for tech in technologies_iter:
     plt.xticks(ticks=range(actual_years.min(),future_years_extended.max()+1,5))
     plt.legend()
     plt.grid(True)
-    plt.savefig(f'PanelNetworkAndARIMA_Forecast_{tech}_{cutoff_training}_to_2030.png', dpi=300)
+    plt.savefig(f'plots/forecast/extended_panel/PanelNetworkAndARIMA_Forecast_{tech}_{cutoff_training}_to_2030.png', dpi=300)
     plt.close()
 
 
@@ -1020,13 +1033,3 @@ for tech, forecast_sum in unconditional_network_forecast_2030_sums:
 print("\nSum of unconditional_network_forecast_2030 for each technology (panel estimated):")
 for tech, forecast_sum in unconditional_panel_network_forecast_2030_sums:
     print(f"{tech}: {forecast_sum:.4f}")
-final_results_df = pd.concat(all_results, ignore_index=True)
-
-# Optional: Setze den Parameter als Index (falls gewünscht)
-final_results_df.set_index(['Technology', 'Parameter'], inplace=True)
-
-# Ausgabe des finalen DataFrames
-print(final_results_df)
-
-# Optional: Speichere das Ergebnis in einer CSV-Datei
-final_results_df.to_csv('arima_technologies_results_with_order.csv')
