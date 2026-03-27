@@ -2,8 +2,11 @@ import mariadb
 import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import matplotlib.gridspec as gridspec
 import numpy as np
 import statsmodels.api as sm
+import seaborn as sns
 from linearmodels.panel import PanelOLS
 from stargazer.stargazer import Stargazer
 from sklearn.linear_model import LinearRegression
@@ -37,6 +40,11 @@ max_priority_year = 2024
 
 # Set to 1 for using logs, 0 not using 
 logs=0
+
+# Set the Seaborn style and color palette
+sns.set_context("paper", font_scale=1.5)  # 'paper' context for publication
+sns.set_style("whitegrid")  # Clean background with subtle grid
+sns.set_palette("deep")  # Use Seaborn's default high-contrast palette
 
 growth_array_corr=[]
 neighborgrowth_array_corr=[]
@@ -114,6 +122,39 @@ for technology, file_path in technologies.items():
     flows_plot_file = f'flows_{technology}.png'
     plt.savefig(flows_plot_file, dpi=300)
     plt.close()
+
+	#fig, ax = plt.subplots(figsize=(7, 5))  # Use golden ratio or similar for journal formats
+
+	# Plot the data
+	#ax.plot(
+	#    all_years['Früheste Priorität'],
+	#    all_years['count'],
+	#    marker='o',
+	#    linestyle='-',
+	#    label='Flows',
+	#)
+	#ax.set_title(f'Patent Family Flows in {technology}', fontsize=14, weight='bold')
+	#ax.set_xlabel('Priority Year', fontsize=12)
+	#ax.set_ylabel('Number of Patent Families', fontsize=12)
+	#ax.spines['top'].set_visible(False)
+
+	# Ticks formatting
+	#ax.xaxis.set_major_locator(ticker.MultipleLocator(10))
+	#ax.tick_params(axis='both', labelsize=10)
+
+	# Grid
+	#ax.grid(True, linestyle='--', alpha=0.5)
+
+	# Legend
+	#ax.legend(frameon=False, fontsize=10)
+
+	# Tight layout for spacing
+	#plt.tight_layout()
+
+	# Save at high DPI and lossless format for publication
+	#flows_plot_file = f'flows_{technology}.tiff'
+	#plt.savefig(flows_plot_file, dpi=600, format='tiff', bbox_inches='tight')
+	#plt.close()
 
     # Plotting Stocks
     plt.figure(figsize=(10, 6))
@@ -294,6 +335,136 @@ for technology, file_path in technologies.items():
     plt.savefig(output_file_h, format='png', dpi=300)
     plt.close()
 
+	""" #New attempt at plotting the citation networks
+	
+	#We should also make sure that the same nodes, if they appear in multiple plots, are always positioned in the same place, so the layout is done once and not over and over again for every network. Then we should combine maybe 4 networks into one figure
+	# Generate layout
+	pos_H = nx.spring_layout(H, seed=42)  # Consistent layout
+
+	# Create figure with publication-friendly size (approx. 7 inches wide)
+	fig, ax = plt.subplots(figsize=(7, 6))
+
+	# Draw nodes
+	nx.draw_networkx_nodes(
+	    H, pos_H,
+	    nodelist=[technology],
+	    node_color=[palette[0]],
+	    node_size=4000,
+	    ax=ax,
+	    edgecolors='black',
+	    linewidths=1.5
+	)
+
+	other_nodes = [node for node in H.nodes if node != technology]
+	nx.draw_networkx_nodes(
+	    H, pos_H,
+ 	    nodelist=other_nodes,
+	    node_color=[palette[1]] * len(other_nodes),
+	    node_size=1000,
+	    ax=ax,
+	    edgecolors='black',
+	    linewidths=0.8
+	)
+
+	# Draw labels with better readability
+	nx.draw_networkx_labels(
+	    H, pos_H,
+	    font_size=10,
+	    font_family='sans-serif',
+	    font_weight='bold',
+	    ax=ax
+	)
+
+	# Draw weighted edges
+	edges_H = H.edges()
+	weights_H = [H[a][b]['weight'] for a, b in edges_H]
+	nx.draw_networkx_edges(
+	    H, pos_H,
+	    edgelist=edges_H,
+	    width=[c * 6 for c in weights_H],
+	    edge_color="gray",
+	    arrows=True,
+	    arrowstyle='-|>',
+	    min_source_margin=15,
+	    min_target_margin=15,
+	    ax=ax
+	)
+
+	# Caption below the figure
+	ax.text(0.5, -0.1, 'Edge thickness represents normalized citation frequency',
+	        ha='center', fontsize=10, transform=ax.transAxes)
+
+	# Clean layout
+	ax.set_title(f'Top 10 Cited Technologies Network for {technology}', fontsize=14, weight='bold')
+	ax.axis('off')
+	plt.tight_layout()
+
+	# Save in TIFF at high resolution
+	output_file_h = f'top_10_cited_network_{technology}_{max_priority_year}.tiff'
+	plt.savefig(output_file_h, format='tiff', dpi=600, bbox_inches='tight')
+	plt.close()
+	"""
+
+	""" # Combine two different networks into one plot
+
+	# Change this to map the one-digit patent classification into colours
+	categories = nx.get_node_attributes(H, 'category')
+	unique_categories = list(sorted(set(categories.values())))
+	color_map = dict(zip(unique_categories, sns.color_palette("deep", n_colors=len(unique_categories))))
+	node_colors = [color_map[categories[node]] for node in H.nodes()]
+
+	# Set up figure with 2 panels side-by-side
+	fig = plt.figure(figsize=(12, 6))  # 6x2 = ideal journal scale
+	gs = gridspec.GridSpec(1, 2, width_ratios=[1, 1])
+
+	# --- Panel A: Network H1 ---
+	ax1 = fig.add_subplot(gs[0, 0])
+	pos1 = nx.spring_layout(H1, seed=42)
+
+	# Draw primary node
+	nx.draw_networkx_nodes(H1, pos1, nodelist=[tech1], node_color=[palette[0]], node_size=3000, ax=ax1, edgecolors='black', linewidths=1.5)
+
+	# Draw other nodes (remove the one that doesn't fit)
+	other_nodes1 = [n for n in H1.nodes if n != tech1]
+	nx.draw_networkx_nodes(H1, pos1, nodelist=other_nodes1, node_color=[palette[1]] * len(other_nodes1), node_size=1000, ax=ax1, edgecolors='black', linewidths=1)
+	nx.draw_networkx_nodes(H, pos_H, node_color=node_colors, node_size=1000, ax=ax)
+
+	# Edges and labels
+	nx.draw_networkx_labels(H1, pos1, font_size=10, font_weight='bold', ax=ax1)
+	weights1 = [H1[u][v]['weight'] for u, v in H1.edges()]
+	nx.draw_networkx_edges(H1, pos1, width=[w * 6 for w in weights1], edge_color='gray', arrows=True, arrowstyle='-|>', ax=ax1)
+
+	# Title and formatting
+	ax1.set_title(f"A. Network for {tech1}", fontsize=12, weight='bold')
+	ax1.axis('off')
+
+	# --- Panel B: Network H2 ---
+	ax2 = fig.add_subplot(gs[0, 1])
+	pos2 = nx.spring_layout(H2, seed=42)
+
+	nx.draw_networkx_nodes(H2, pos2, nodelist=[tech2], node_color=[palette[2]], node_size=3000, ax=ax2, edgecolors='black', linewidths=1.5)
+	other_nodes2 = [n for n in H2.nodes if n != tech2]
+	nx.draw_networkx_nodes(H2, pos2, nodelist=other_nodes2, node_color=[palette[3]] * len(other_nodes2), node_size=1000, ax=ax2, edgecolors='black', linewidths=1)
+	nx.draw_networkx_nodes(H, pos_H, node_color=node_colors, node_size=1000, ax=ax)
+
+	nx.draw_networkx_labels(H2, pos2, font_size=10, font_weight='bold', ax=ax2)
+	weights2 = [H2[u][v]['weight'] for u, v in H2.edges()]
+	nx.draw_networkx_edges(H2, pos2, width=[w * 6 for w in weights2], edge_color='gray', arrows=True, arrowstyle='-|>', ax=ax2)
+
+	ax2.set_title(f"B. Network for {tech2}", fontsize=12, weight='bold')
+	ax2.axis('off')
+
+	for category, color in color_map.items():
+    		ax.scatter([], [], c=[color], label=category, s=100)  # Dummy scatter for legend entry
+	ax.legend(title="Category", bbox_to_anchor=(1.05, 1), loc='upper left')
+
+	# Layout and save
+	plt.tight_layout()
+	pdf_output_file = f'comparison_networks_{tech1}_{tech2}.pdf'
+	plt.savefig(pdf_output_file, format='pdf', dpi=600, bbox_inches='tight')
+	plt.close()
+	"""
+
     """Processing cited growth rates"""
 
     df = pd.read_csv('class_year_normalized_counts_4_digits.csv')
@@ -473,6 +644,43 @@ for technology, file_path in technologies.items():
     growth_plot_file = f'Growth_{technology}.png'
     plt.savefig(growth_plot_file, dpi=300)
     plt.close()  # Close the plot to avoid display
+
+	"""
+	# Create figure with appropriate size for journals (~7in wide)
+	fig, ax = plt.subplots(figsize=(7, 5))
+
+	# Plot the growth line
+	ax.plot(
+	    temp_data['Year'],
+	    temp_data['Technology_Growth'],
+	    marker='o',
+	    linestyle='-',
+	    color=palette[0],
+	    label='Growth Data'
+	)
+
+	# Title and axis labels
+	ax.set_title(f'Relative Growth of Patent Families in {technology}', fontsize=14, weight='bold')
+	ax.set_xlabel('Year', fontsize=12)
+	ax.set_ylabel('Relative Growth', fontsize=12)
+
+	# Grid and legend
+	ax.grid(True, linestyle='--', alpha=0.5)
+	ax.legend(frameon=False, fontsize=10)
+
+	# Improve tick label size
+	ax.tick_params(axis='both', labelsize=10)
+
+	# Tight layout
+	plt.tight_layout()
+
+	# Save as high-resolution vector graphic
+	growth_plot_file = f'Growth_{technology}.pdf'
+	plt.savefig(growth_plot_file, format='pdf', dpi=600, bbox_inches='tight')
+	plt.close()
+	"""
+
+
     """Regression for all available data"""
     # Define the dependent variable (Technology Growth) and the independent variable (Cited Classes Growth)
     X = sm.add_constant(temp_data['Weighted_Cited_Classes_Growth'])  # Add constant for the intercept
@@ -560,6 +768,60 @@ plt.text(0.5, 0.9, equation_text, transform=plt.gca().transAxes,
          fontsize=10, verticalalignment='top', bbox=dict(facecolor='white', alpha=0.5))
 plt.legend()
 plt.savefig('Scatter_g_anng_with_regression.png', dpi=300)
+
+	"""
+	# Prepare regression
+	X_anng = sm.add_constant(neighborgrowth_array_corr)
+	model_anng = sm.OLS(growth_array_corr, X_anng).fit()
+	slope = model_anng.params[1]
+	intercept = model_anng.params[0]
+	r_squared = model_anng.rsquared
+	p_value = model_anng.pvalues[1]
+	regression_line = slope * neighborgrowth_array_corr + intercept
+
+	# Create figure
+	fig, ax = plt.subplots(figsize=(7, 5))
+
+	# Scatter points and regression line
+	sns.regplot(
+	    data=df,
+	    x="NeighborGrowth",
+	    y="TechnologyGrowth",
+	    ax=ax,
+	    scatter_kws={"s": 50, "color": palette[0], "edgecolor": "black", "linewidth": 0.5},
+	    line_kws={"color": palette[2], "linewidth": 2},
+	    ci=95
+	)
+
+	# Axis labels
+	ax.set_xlabel(f'Avg. Neighbor Tech Growth ({start_year}–{end_year})', fontsize=12)
+	ax.set_ylabel(f'Technology Growth ({start_year}–{end_year})', fontsize=12)
+
+	# Equation and stats box
+	equation_text = f'$y = {slope:.2f}x + {intercept:.2f}$\n$R^2 = {r_squared:.2f}$\n$p = {p_value:.3f}$'
+	ax.text(
+	    0.05, 0.95,
+	    equation_text,
+	    transform=ax.transAxes,
+	    fontsize=11,
+	    verticalalignment='top',
+	    bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.3')
+	)
+
+	# Legend and grid
+	ax.legend(frameon=False, fontsize=10)
+	ax.grid(True, linestyle='--', alpha=0.5)
+
+	# Tick size
+	ax.tick_params(axis='both', labelsize=10)
+
+	# Tight layout and save
+	plt.tight_layout()
+	plt.savefig('Scatter_g_anng_with_regression.pdf', format='pdf', dpi=600, bbox_inches='tight')
+	plt.close()
+
+	"""
+
 #print(model.summary())
 
 #print(results_df)
@@ -649,6 +911,42 @@ plt.yscale('log')
 plt.title('Histogram of Marginal Effects - Individual')
 plt.savefig('marginaleffects_individual.png', dpi=300)
 plt.close()
+
+	"""
+	# Extract data
+	data = marginresults_listed_individual['Marginaleffect_IndividualBeta']
+
+	# Create figure
+	fig, ax = plt.subplots(figsize=(7, 5))
+
+	# Histogram
+	ax.hist(
+	    data,
+	    bins=100,
+	    edgecolor='black',
+	    color=palette[0],
+	    log=True  # Log-scaled y-axis
+	)
+	
+	#add density approximation
+	sns.kdeplot(data, ax=ax, color=palette[1], linewidth=2, label='Density')
+	ax.legend(frameon=False)
+
+
+	# Labels and title
+	ax.set_xlabel('Marginal Effect (Individual Beta)', fontsize=12)
+	ax.set_ylabel('Frequency (log scale)', fontsize=12)
+	ax.set_title('Histogram of Marginal Effects – Individual', fontsize=14, weight='bold')
+
+	# Final touches
+	ax.tick_params(axis='both', labelsize=10)
+	ax.grid(True, linestyle='--', alpha=0.5)
+	plt.tight_layout()
+
+	# Save as vector graphic
+	plt.savefig('marginaleffects_individual.pdf', format='pdf', dpi=600, bbox_inches='tight')
+	plt.close()
+	"""
 
 # Plot for 'Marginaleffect_GlobalBeta'
 plt.figure(figsize=(10, 6))
