@@ -1,0 +1,1714 @@
+import os
+import warnings
+
+import mariadb
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import statsmodels.api as sm
+
+from linearmodels.panel import PanelOLS
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
+from pmdarima.arima import auto_arima
+
+
+# =============================================================================
+# General setup
+# =============================================================================
+
+warnings.filterwarnings("ignore")
+
+OUTPUT_DIRS = [
+    "plots/flows",
+    "plots/stocks",
+    "plots/growth",
+    "plots/networks/full",
+    "plots/networks/top10",
+    "plots/forecast/panel_insample_fit",
+    "plots/forecast/arima_fit",
+    "plots/forecast/comparison_panel",
+    "plots/forecast/extended_panel",
+    "plots/marginal_effects",
+    "plots/analysis",
+    "tables",
+    "data_output",
+]
+
+for directory in OUTPUT_DIRS:
+    os.makedirs(directory, exist_ok=True)
+
+
+# =============================================================================
+# Plot style
+# =============================================================================
+
+sns.set_theme(
+    style="whitegrid",
+    context="paper",
+    font_scale=1.25,
+    rc={
+        "figure.dpi": 300,
+        "savefig.dpi": 300,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.titleweight": "bold",
+        "legend.frameon": False,
+    },
+)
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+technologies = {
+    "Pumpedhydro": "Pumpedhydro_data.csv",
+    "Flywheel": "Flywheel_data.csv",
+    "Liquidair": "Liquidair_data.csv",
+    "Compressedair": "Compressedair_data.csv",
+    "Drygravity": "Drygravity_data.csv",
+    "Pumpedthermal": "Pumpedthermal_data.csv",
+    "Redoxflow": "Redoxflow_data.csv",
+    "Supercapacitors": "Supercapacitors_data.csv",
+    "LithiumNickelCobaltOxide": "LithiumNickelCobaltOxide_data.csv",
+    "InorganicSolidState": "InorganicSolidState_data.csv",
+    "NickelManganeseCobalt": "Nickelmanganesecobalt_data.csv",
+    "SodiumIon": "SodiumIon_data.csv",
+    "SolarThermal": "SolarThermal.csv",
+    "ThermalLiquid": "ThermalLiquid_data.csv",
+    "ThermalLatent": "ThermalLatent_data.csv",
+    "ThermalSolid": "ThermalSolid_data.csv",
+    "SteamAccumulators": "SteamHeatAccumulators_data.csv",
+}
+
+cpc_depth = 4
+offset_stock = 10
+max_priority_year = 2024
+
+logs = 0
+
+estimation_year_start = 1980
+estimation_year_end = 2023
+margineffect_year = estimation_year_end
+
+x = 1
+
+cutoff_training = 2018
+forecast_end_year = 2023
+extended_forecast_end_year = 2030
+
+class_growth_file = "class_year_normalized_counts_4_digits.csv"
+
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+
+def clean_numeric(series):
+    """Convert a Series to numeric values and replace infinite values with NaN."""
+    return pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+
+def calculate_growth(series, periods=1, use_logs=False):
+    """Calculate percentage or log growth."""
+    pct_change = series.pct_change(periods=periods)
+
+    if use_logs:
+        return np.log1p(pct_change)
+
+    return pct_change
+
+
+def safe_compound_growth(growth_values):
+    """Calculate cumulative growth from a sequence of growth rates."""
+    growth_values = np.asarray(growth_values, dtype=float)
+    growth_values = growth_values[np.isfinite(growth_values)]
+
+    if len(growth_values) == 0:
+        return np.nan
+
+    return np.prod(1 + growth_values) - 1
+
+
+def create_citation_vector(aggregated_citations):
+    """Create a sorted citation vector indexed by CPC class."""
+    if aggregated_citations.empty:
+        return pd.Series(dtype=float, name="total_normalized_citations")
+
+    citation_vector = (
+        aggregated_citations
+        .set_index("cpc_class")["total_normalized_citations"]
+        .sort_index()
+    )
+
+    citation_vector.name = "total_normalized_citations"
+
+    return citation_vector
+
+
+def normalize_citation_vector(citation_vector):
+    """Normalize a citation vector so that all weights sum to one."""
+    if citation_vector.empty:
+        return pd.Series(dtype=float, name="total_normalized_citations")
+
+    total_sum = citation_vector.sum()
+
+    if total_sum <= 0 or not np.isfinite(total_sum):
+        return pd.Series(dtype=float, name="total_normalized_citations")
+
+    normalized_vector = citation_vector / total_sum
+    normalized_vector.name = "total_normalized_citations"
+
+    return normalized_vector
+
+
+def safe_arima_forecast(y_train, n_periods):
+    """
+    Estimate an ARIMA model and forecast n periods ahead.
+    If the time series is too short or estimation fails, fall back to a random walk.
+    """
+    y_train = np.asarray(y_train, dtype=float)
+    y_train = y_train[np.isfinite(y_train)]
+
+    if len(y_train) == 0:
+        return np.repeat(np.nan, n_periods), None
+
+    if len(y_train) < 5:
+        return np.repeat(y_train[-1], n_periods), None
+
+    try:
+        model_fit = auto_arima(
+            y_train,
+            start_p=0,
+            start_q=0,
+            max_p=3,
+            max_q=3,
+            seasonal=False,
+            suppress_warnings=True,
+            error_action="ignore",
+            stepwise=True,
+        )
+
+        forecast = np.asarray(model_fit.predict(n_periods=n_periods), dtype=float)
+
+        return forecast, model_fit
+
+    except Exception as error:
+        print(f"ARIMA estimation failed, using random walk instead. Error: {error}")
+        return np.repeat(y_train[-1], n_periods), None
+
+
+def random_walk_forecast(y_train, n_periods):
+    """Forecast future values using the last observed value."""
+    y_train = np.asarray(y_train, dtype=float)
+    y_train = y_train[np.isfinite(y_train)]
+
+    if len(y_train) == 0:
+        return np.repeat(np.nan, n_periods)
+
+    return np.repeat(y_train[-1], n_periods)
+
+
+def save_long_lineplot(
+    plot_df,
+    output_file,
+    title,
+    xlabel="Year",
+    ylabel="Growth",
+    vertical_lines=None,
+):
+    """Create a consistent line plot from long-format data."""
+    plt.figure(figsize=(11, 6))
+
+    sns.lineplot(
+        data=plot_df,
+        x="Year",
+        y="Value",
+        hue="Series",
+        style="Series",
+        markers=True,
+        dashes=False,
+        linewidth=2.2,
+    )
+
+    if vertical_lines is not None:
+        for year, linestyle in vertical_lines:
+            plt.axvline(year, linestyle=linestyle, color="grey", linewidth=1.2)
+
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def save_simple_lineplot(data, x_col, y_col, output_file, title, xlabel, ylabel):
+    """Create a clean one-series line plot."""
+    plt.figure(figsize=(10, 6))
+
+    sns.lineplot(
+        data=data,
+        x=x_col,
+        y=y_col,
+        marker="o",
+        linewidth=2.2,
+    )
+
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+# =============================================================================
+# CPC class growth data
+# =============================================================================
+
+def prepare_cpc_growth_data(file_path):
+    """
+    Prepare a balanced CPC class-year panel with cumulative counts and growth rates.
+    """
+    df = pd.read_csv(file_path)
+
+    df = df[df["Year"] != 9999].copy()
+    df["Year"] = clean_numeric(df["Year"])
+    df["Normalized_Count"] = clean_numeric(df["Normalized_Count"])
+    df = df.dropna(subset=["Class", "Year", "Normalized_Count"])
+    df["Year"] = df["Year"].astype(int)
+
+    df = df.sort_values(by=["Class", "Year"])
+
+    min_year = int(df["Year"].min())
+    max_year = int(df["Year"].max())
+
+    yearframe = pd.DataFrame({"Year": range(min_year, max_year + 1)})
+
+    filled_frames = []
+
+    for cls in df["Class"].unique():
+        class_df = df[df["Class"] == cls].copy()
+        class_df = pd.merge(yearframe, class_df, on="Year", how="left")
+        class_df["Class"] = cls
+        class_df["Normalized_Count"] = class_df["Normalized_Count"].fillna(0)
+        class_df["Cumulative_Sum"] = class_df["Normalized_Count"].cumsum()
+        filled_frames.append(class_df)
+
+    filled_df = pd.concat(filled_frames, ignore_index=True)
+    filled_df = filled_df.sort_values(by=["Class", "Year"])
+
+    growth_col = f"Growth_Rate_{x}_Years"
+
+    filled_df[growth_col] = (
+        filled_df
+        .groupby("Class")["Cumulative_Sum"]
+        .transform(lambda s: calculate_growth(s, periods=x, use_logs=(logs == 1)))
+    )
+
+    total_cumulative_sum = (
+        filled_df
+        .groupby("Year")["Cumulative_Sum"]
+        .sum()
+        .reset_index()
+        .rename(columns={"Cumulative_Sum": "Total_Cumulative_Sum"})
+    )
+
+    total_growth_col = f"Total_Growth_Rate_{x}_Years"
+
+    total_cumulative_sum[total_growth_col] = calculate_growth(
+        total_cumulative_sum["Total_Cumulative_Sum"],
+        periods=x,
+        use_logs=(logs == 1),
+    )
+
+    filled_df = filled_df.merge(
+        total_cumulative_sum[["Year", "Total_Cumulative_Sum", total_growth_col]],
+        on="Year",
+        how="left",
+    )
+
+    filled_df[growth_col] = clean_numeric(filled_df[growth_col])
+    filled_df[total_growth_col] = clean_numeric(filled_df[total_growth_col])
+
+    filled_df[f"Normalized_Growth_Rate_{x}_Years"] = (
+        filled_df[growth_col] / filled_df[total_growth_col]
+    )
+
+    filled_df = filled_df.replace([np.inf, -np.inf], np.nan)
+
+    # The panel construction only requires class-level growth.
+    filled_df = filled_df.dropna(subset=[growth_col])
+
+    return filled_df
+
+
+filled_df = prepare_cpc_growth_data(class_growth_file)
+
+
+# =============================================================================
+# Database connection
+# =============================================================================
+
+connection = mariadb.connect(
+    user="",          # Add username if needed
+    host="localhost",
+    database="patstat",
+)
+
+cursor = connection.cursor(dictionary=True)
+
+
+# =============================================================================
+# Containers
+# =============================================================================
+
+growth_array_corr = []
+neighborgrowth_array_corr = []
+
+technology_data = {}
+margincitframe_rows = []
+
+
+# =============================================================================
+# Main technology loop
+# =============================================================================
+
+for technology, file_path in technologies.items():
+    print(f"\nProcessing technology: {technology}")
+
+    family_data = pd.read_csv(file_path)
+
+    family_data["Früheste Priorität"] = clean_numeric(family_data["Früheste Priorität"])
+    family_data = family_data.dropna(subset=["Familiennummer", "Früheste Priorität"])
+    family_data["Früheste Priorität"] = family_data["Früheste Priorität"].astype(int)
+
+    if family_data.empty:
+        print(f"No valid patent data for {technology}. Skipping.")
+        continue
+
+    print(f"Number of patents for technology {technology}: {len(family_data)}")
+
+    local_estimation_start = estimation_year_start
+    local_estimation_end = estimation_year_end
+
+    if family_data["Früheste Priorität"].min() > local_estimation_start:
+        local_estimation_start = int(family_data["Früheste Priorität"].min()) + 1
+
+    if family_data["Früheste Priorität"].max() < local_estimation_end:
+        local_estimation_end = int(family_data["Früheste Priorität"].max())
+
+    # -------------------------------------------------------------------------
+    # Patent flows and stocks
+    # -------------------------------------------------------------------------
+
+    flows = (
+        family_data
+        .groupby("Früheste Priorität")
+        .size()
+        .reset_index(name="count")
+    )
+
+    all_years = pd.DataFrame({
+        "Früheste Priorität": range(
+            int(flows["Früheste Priorität"].min()),
+            int(flows["Früheste Priorität"].max()) + 1,
+        )
+    })
+
+    all_years = all_years.merge(flows, on="Früheste Priorität", how="left")
+    all_years["count"] = all_years["count"].fillna(0)
+    all_years["Stock"] = all_years["count"].cumsum()
+
+    all_years = all_years[all_years["Stock"] >= offset_stock].copy()
+
+    if all_years.empty:
+        print(f"No stock observations above offset threshold for {technology}. Skipping.")
+        continue
+
+    if all_years["Früheste Priorität"].min() > local_estimation_start:
+        local_estimation_start = int(all_years["Früheste Priorität"].min()) + 1
+
+    growth_col_tech = f"Technology_Growth_Rate_{x}_Years"
+
+    all_years[growth_col_tech] = calculate_growth(
+        all_years["Stock"],
+        periods=x,
+        use_logs=(logs == 1),
+    )
+
+    all_years_plot = all_years.rename(columns={"Früheste Priorität": "Year"})
+
+    save_simple_lineplot(
+        data=all_years_plot,
+        x_col="Year",
+        y_col="count",
+        output_file=f"plots/flows/flows_{technology}.png",
+        title=f"Patent Family Flows: {technology}",
+        xlabel="Year",
+        ylabel="Number of patent families",
+    )
+
+    save_simple_lineplot(
+        data=all_years_plot,
+        x_col="Year",
+        y_col="Stock",
+        output_file=f"plots/stocks/stocks_{technology}.png",
+        title=f"Patent Family Stock: {technology}",
+        xlabel="Year",
+        ylabel="Cumulative patent families",
+    )
+
+    save_simple_lineplot(
+        data=all_years_plot,
+        x_col="Year",
+        y_col=growth_col_tech,
+        output_file=f"plots/growth/Growth_{technology}.png",
+        title=f"Patent Stock Growth: {technology}",
+        xlabel="Year",
+        ylabel="Growth rate",
+    )
+
+    # -------------------------------------------------------------------------
+    # Citation data
+    # -------------------------------------------------------------------------
+
+    family_priority_map = (
+        family_data[["Familiennummer", "Früheste Priorität"]]
+        .drop_duplicates()
+        .set_index("Familiennummer")["Früheste Priorität"]
+        .to_dict()
+    )
+
+    query = """
+        SELECT
+            c.docdb_family_id,
+            c.cited_docdb_family_id,
+            d.cpc_class_symbol
+        FROM tls228_docdb_fam_citn AS c
+        LEFT JOIN tls225_docdb_fam_cpc AS d
+            ON c.cited_docdb_family_id = d.docdb_family_id
+        WHERE c.docdb_family_id = %s;
+    """
+
+    all_results = []
+
+    for family_number, priority_year in family_priority_map.items():
+        try:
+            cursor.execute(query, (family_number,))
+
+            while True:
+                rows = cursor.fetchmany(1000)
+
+                if not rows:
+                    break
+
+                for row in rows:
+                    row["Prioritätsjahr"] = priority_year
+
+                all_results.extend(rows)
+
+        except mariadb.Error as error:
+            print(f"Error processing family number {family_number}: {error}")
+
+    citation_results = pd.DataFrame(all_results)
+
+    if citation_results.empty or "cpc_class_symbol" not in citation_results.columns:
+        print(f"No usable citation data for {technology}. Skipping.")
+        continue
+
+    citation_results = citation_results.dropna(subset=["cpc_class_symbol"])
+    citation_results = citation_results[
+        ~citation_results["cpc_class_symbol"].str.startswith("Y", na=False)
+    ].copy()
+
+    if citation_results.empty:
+        print(f"No non-Y CPC citation data for {technology}. Skipping.")
+        continue
+
+    print(f"Number of citations for technology {technology}: {len(citation_results)}")
+
+    cited_class_counts = (
+        citation_results
+        .groupby("cited_docdb_family_id")["cpc_class_symbol"]
+        .nunique()
+        .reset_index()
+    )
+
+    cited_class_counts.columns = ["cited_docdb_family_id", "class_count"]
+
+    citation_results = citation_results.merge(
+        cited_class_counts,
+        on="cited_docdb_family_id",
+        how="left",
+    )
+
+    citation_results["class_count"] = clean_numeric(citation_results["class_count"])
+    citation_results = citation_results.dropna(subset=["class_count"])
+    citation_results = citation_results[citation_results["class_count"] > 0].copy()
+
+    citation_results["normalized_citation"] = 1 / citation_results["class_count"]
+
+    citation_results["cpc_class_symbol_truncated"] = (
+        citation_results["cpc_class_symbol"]
+        .str[:cpc_depth]
+    )
+
+    aggregated_citations = (
+        citation_results
+        .groupby("cpc_class_symbol_truncated")["normalized_citation"]
+        .sum()
+        .reset_index()
+    )
+
+    aggregated_citations.columns = ["cpc_class", "total_normalized_citations"]
+
+    citation_vector = create_citation_vector(aggregated_citations)
+    citation_vector_normalized = normalize_citation_vector(citation_vector)
+
+    if citation_vector_normalized.empty:
+        print(f"No valid normalized citation vector for {technology}. Skipping.")
+        continue
+
+    # -------------------------------------------------------------------------
+    # Citation network plots
+    # -------------------------------------------------------------------------
+
+    G = nx.DiGraph()
+    G.add_node(technology, type="central")
+
+    for code, weight in citation_vector_normalized.items():
+        G.add_node(code, type="code")
+        G.add_edge(technology, code, weight=weight)
+
+    pos = nx.spring_layout(G, seed=42)
+
+    plt.figure(figsize=(10, 8))
+    nx.draw_networkx_nodes(G, pos, node_color="lightblue", node_size=600)
+    nx.draw_networkx_labels(G, pos, font_size=8, font_family="sans-serif")
+
+    edges = G.edges()
+    weights = [G[u][v]["weight"] for u, v in edges]
+
+    nx.draw_networkx_edges(
+        G,
+        pos,
+        edgelist=edges,
+        width=[w * 6 for w in weights],
+        edge_color="gray",
+        arrowstyle="-|>",
+    )
+
+    plt.axis("off")
+    plt.title(f"Citation Network: {technology}")
+    plt.tight_layout()
+    plt.savefig(
+        f"plots/networks/full/normalized_citation_network_{technology}_{max_priority_year}.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+    top_10_citvector = citation_vector_normalized.sort_values(ascending=False).head(10)
+
+    H = nx.DiGraph()
+    H.add_node(technology, type="central")
+
+    for code, weight in top_10_citvector.items():
+        H.add_node(code, type="code")
+        H.add_edge(technology, code, weight=weight)
+
+    pos_H = nx.spring_layout(H, seed=42)
+
+    plt.figure(figsize=(10, 8))
+
+    nx.draw_networkx_nodes(
+        H,
+        pos_H,
+        nodelist=[technology],
+        node_color="lightblue",
+        node_size=6000,
+    )
+
+    other_nodes = [node for node in H.nodes if node != technology]
+
+    nx.draw_networkx_nodes(
+        H,
+        pos_H,
+        nodelist=other_nodes,
+        node_color="lightblue",
+        node_size=1200,
+    )
+
+    nx.draw_networkx_labels(H, pos_H, font_size=9, font_family="sans-serif")
+
+    edges_H = H.edges()
+    weights_H = [H[a][b]["weight"] for a, b in edges_H]
+
+    nx.draw_networkx_edges(
+        H,
+        pos_H,
+        edgelist=edges_H,
+        width=[weight * 8 for weight in weights_H],
+        edge_color="gray",
+        arrows=True,
+        arrowstyle="-|>",
+    )
+
+    plt.text(
+        0.5,
+        -0.08,
+        "Edge thickness represents normalized citation frequency",
+        horizontalalignment="center",
+        fontsize=10,
+        transform=plt.gca().transAxes,
+    )
+
+    plt.axis("off")
+    plt.title(f"Top 10 Cited CPC Classes: {technology}")
+    plt.tight_layout()
+    plt.savefig(
+        f"plots/networks/top10/top_10_cited_network_{technology}_{max_priority_year}.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+    # -------------------------------------------------------------------------
+    # Cross-sectional g vs. ANNG snapshot
+    # -------------------------------------------------------------------------
+
+    snapshot_start_year = 2013
+    snapshot_end_year = 2023
+
+    if all_years["Früheste Priorität"].min() > snapshot_start_year:
+        snapshot_start_year = int(all_years["Früheste Priorität"].min()) + 1
+
+    if (
+        snapshot_start_year in all_years["Früheste Priorität"].values
+        and snapshot_end_year in all_years["Früheste Priorität"].values
+    ):
+        start_year_data_classes = filled_df[
+            filled_df["Year"] == snapshot_start_year
+        ][["Class", "Cumulative_Sum"]].rename(
+            columns={"Cumulative_Sum": "Stock_Start_Year"}
+        )
+
+        end_year_data_classes = filled_df[
+            filled_df["Year"] == snapshot_end_year
+        ][["Class", "Cumulative_Sum"]].rename(
+            columns={"Cumulative_Sum": "Stock_End_Year"}
+        )
+
+        growth_data_classes = pd.merge(
+            start_year_data_classes,
+            end_year_data_classes,
+            on="Class",
+            how="inner",
+        )
+
+        growth_data_classes = growth_data_classes[
+            growth_data_classes["Stock_Start_Year"] > 0
+        ].copy()
+
+        if logs == 1:
+            growth_data_classes["Growth_Rate"] = np.log(
+                growth_data_classes["Stock_End_Year"]
+                / growth_data_classes["Stock_Start_Year"]
+            )
+        else:
+            growth_data_classes["Growth_Rate"] = (
+                growth_data_classes["Stock_End_Year"]
+                - growth_data_classes["Stock_Start_Year"]
+            ) / growth_data_classes["Stock_Start_Year"]
+
+        growth_data_classes = growth_data_classes.replace([np.inf, -np.inf], np.nan)
+        growth_data_classes = growth_data_classes.dropna(subset=["Growth_Rate"])
+
+        merged_data = pd.merge(
+            citation_vector_normalized,
+            growth_data_classes,
+            left_index=True,
+            right_on="Class",
+            how="inner",
+        )
+
+        if not merged_data.empty:
+            merged_data["Weighted_Growth"] = (
+                merged_data["total_normalized_citations"]
+                * merged_data["Growth_Rate"]
+            )
+
+            overall_weighted_growth = merged_data["Weighted_Growth"].sum()
+
+            start_stock = all_years.loc[
+                all_years["Früheste Priorität"] == snapshot_start_year,
+                "Stock",
+            ].values[0]
+
+            end_stock = all_years.loc[
+                all_years["Früheste Priorität"] == snapshot_end_year,
+                "Stock",
+            ].values[0]
+
+            growth_technology = np.log(end_stock / start_stock)
+
+            growth_array_corr.append(growth_technology)
+            neighborgrowth_array_corr.append(overall_weighted_growth)
+
+    # -------------------------------------------------------------------------
+    # Panel input data
+    # -------------------------------------------------------------------------
+
+    year_array = []
+    g_t_array = []
+    x_t_array = []
+    stock_array = []
+
+    for t in range(local_estimation_start, local_estimation_end + 1):
+        growth_values = all_years.loc[
+            all_years["Früheste Priorität"] == t,
+            growth_col_tech,
+        ].values
+
+        stock_values = all_years.loc[
+            all_years["Früheste Priorität"] == t,
+            "Stock",
+        ].values
+
+        if len(growth_values) == 0 or len(stock_values) == 0:
+            continue
+
+        citation_results_time = citation_results[
+            citation_results["Prioritätsjahr"] <= t
+        ].copy()
+
+        if citation_results_time.empty:
+            continue
+
+        aggregated_citations_time = (
+            citation_results_time
+            .groupby("cpc_class_symbol_truncated")["normalized_citation"]
+            .sum()
+            .reset_index()
+        )
+
+        aggregated_citations_time.columns = ["cpc_class", "total_normalized_citations"]
+
+        citation_vector_time = create_citation_vector(aggregated_citations_time)
+        citation_vector_normalized_time = normalize_citation_vector(citation_vector_time)
+
+        if citation_vector_normalized_time.empty:
+            continue
+
+        growth_data_classes_time = filled_df[filled_df["Year"] == t - 1].copy()
+
+        if growth_data_classes_time.empty:
+            continue
+
+        w_g_frame = pd.merge(
+            citation_vector_normalized_time,
+            growth_data_classes_time,
+            left_index=True,
+            right_on="Class",
+            how="inner",
+        )
+
+        if w_g_frame.empty:
+            continue
+
+        w_g_frame["Weighted_Growth"] = (
+            w_g_frame["total_normalized_citations"]
+            * w_g_frame[f"Growth_Rate_{x}_Years"]
+        )
+
+        anng_time = w_g_frame["Weighted_Growth"].sum()
+
+        year_array.append(t)
+        g_t_array.append(growth_values[0])
+        x_t_array.append(anng_time)
+        stock_array.append(stock_values[0])
+
+    temp_data = pd.DataFrame({
+        "Year": year_array,
+        "Technology_Growth": g_t_array,
+        "Weighted_Cited_Classes_Growth": x_t_array,
+        "Stock": stock_array,
+    })
+
+    temp_data["Technology_Growth"] = clean_numeric(temp_data["Technology_Growth"])
+    temp_data["Weighted_Cited_Classes_Growth"] = clean_numeric(
+        temp_data["Weighted_Cited_Classes_Growth"]
+    )
+    temp_data["Stock"] = clean_numeric(temp_data["Stock"])
+
+    temp_data = temp_data.dropna(
+        subset=["Technology_Growth", "Weighted_Cited_Classes_Growth", "Stock"]
+    )
+
+    if temp_data.empty:
+        print(f"No valid panel observations for {technology}. Skipping.")
+        continue
+
+    technology_data[technology] = temp_data
+
+    # -------------------------------------------------------------------------
+    # Citation vector snapshot for marginal effects and extended forecasts
+    # -------------------------------------------------------------------------
+
+    citation_results_marginal = citation_results[
+        citation_results["Prioritätsjahr"] <= margineffect_year
+    ].copy()
+
+    aggregated_citations_marginal = (
+        citation_results_marginal
+        .groupby("cpc_class_symbol_truncated")["normalized_citation"]
+        .sum()
+        .reset_index()
+    )
+
+    aggregated_citations_marginal.columns = ["cpc_class", "total_normalized_citations"]
+
+    citation_vector_marginal = create_citation_vector(aggregated_citations_marginal)
+    citation_vector_normalized_marginal = normalize_citation_vector(
+        citation_vector_marginal
+    )
+
+    if not citation_vector_normalized_marginal.empty:
+        margincitframe_rows.append(pd.DataFrame({
+            "Technology": technology,
+            "Cited Technology Class": citation_vector_normalized_marginal.index,
+            "Normalized citations": citation_vector_normalized_marginal.values,
+        }))
+
+
+cursor.close()
+connection.close()
+
+
+# =============================================================================
+# Citation vectors
+# =============================================================================
+
+if margincitframe_rows:
+    margincitframe = pd.concat(margincitframe_rows, ignore_index=True)
+else:
+    margincitframe = pd.DataFrame(
+        columns=["Technology", "Cited Technology Class", "Normalized citations"]
+    )
+
+margincitframe.to_csv(
+    f"data_output/Citationvectors_{margineffect_year}.csv",
+    index=False,
+)
+
+
+# =============================================================================
+# Cross-sectional g vs. ANNG analysis
+# =============================================================================
+
+if len(growth_array_corr) >= 3:
+    neighborgrowth_array_corr = np.array(neighborgrowth_array_corr, dtype=float)
+    growth_array_corr = np.array(growth_array_corr, dtype=float)
+
+    valid_corr_mask = (
+        np.isfinite(neighborgrowth_array_corr)
+        & np.isfinite(growth_array_corr)
+    )
+
+    neighborgrowth_array_corr = neighborgrowth_array_corr[valid_corr_mask]
+    growth_array_corr = growth_array_corr[valid_corr_mask]
+
+    if len(growth_array_corr) >= 3:
+        g_anng_corr = np.corrcoef(growth_array_corr, neighborgrowth_array_corr)
+        print("Correlation between g and ANNG:")
+        print(g_anng_corr)
+
+        corr_df = pd.DataFrame({
+            "ANNG": neighborgrowth_array_corr,
+            "Technology_Growth": growth_array_corr,
+        })
+
+        plt.figure(figsize=(8, 6))
+
+        sns.regplot(
+            data=corr_df,
+            x="ANNG",
+            y="Technology_Growth",
+            ci=None,
+            scatter_kws={"s": 45},
+            line_kws={"linewidth": 2.2},
+        )
+
+        X_anng = sm.add_constant(neighborgrowth_array_corr)
+        model_anng = sm.OLS(growth_array_corr, X_anng).fit()
+
+        slope = model_anng.params[1]
+        intercept = model_anng.params[0]
+        r_squared = model_anng.rsquared
+        p_value = model_anng.pvalues[1]
+
+        equation_text = (
+            f"y = {slope:.2f}x + {intercept:.2f}\n"
+            f"R² = {r_squared:.2f}\n"
+            f"p-value = {p_value:.3f}"
+        )
+
+        plt.text(
+            0.05,
+            0.95,
+            equation_text,
+            transform=plt.gca().transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+        )
+
+        plt.title("Technology Growth and Average Nearest Neighbor Growth")
+        plt.xlabel("Average nearest neighbor technology growth, 2013–2023")
+        plt.ylabel("Technology growth, 2013–2023")
+        plt.tight_layout()
+        plt.savefig(
+            "plots/analysis/Scatter_g_anng_with_regression.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
+
+
+# =============================================================================
+# Assemble panel data
+# =============================================================================
+
+if not technology_data:
+    raise RuntimeError("No valid technology-level panel data could be constructed.")
+
+all_technology_data = (
+    pd.concat(
+        technology_data.values(),
+        keys=technology_data.keys(),
+        names=["Technology", "Index"],
+    )
+    .reset_index()
+    .drop(columns=["Index"])
+)
+
+all_technology_data = all_technology_data.sort_values(["Technology", "Year"])
+
+all_technology_data["Total_Stock"] = (
+    all_technology_data
+    .groupby("Year")["Stock"]
+    .transform("sum")
+)
+
+all_technology_data["Technology_Share"] = (
+    all_technology_data["Stock"] / all_technology_data["Total_Stock"]
+)
+
+total_stock_growth = (
+    all_technology_data[["Year", "Total_Stock"]]
+    .drop_duplicates()
+    .sort_values("Year")
+)
+
+if logs == 1:
+    total_stock_growth["Total_Stock_Growth"] = np.log1p(
+        total_stock_growth["Total_Stock"].pct_change(periods=x)
+    )
+else:
+    total_stock_growth["Total_Stock_Growth"] = (
+        total_stock_growth["Total_Stock"].pct_change(periods=x)
+    )
+
+all_technology_data = all_technology_data.merge(
+    total_stock_growth[["Year", "Total_Stock_Growth"]],
+    on="Year",
+    how="left",
+)
+
+all_technology_data = all_technology_data.replace([np.inf, -np.inf], np.nan)
+all_technology_data = all_technology_data.dropna(
+    subset=[
+        "Technology_Growth",
+        "Weighted_Cited_Classes_Growth",
+        "Stock",
+        "Technology_Share",
+    ]
+)
+
+all_technology_data.to_csv("data_output/alltechnology_data.csv", index=False)
+
+
+# =============================================================================
+# Panel fixed-effects model: full sample
+# =============================================================================
+
+panel_indexed_full = all_technology_data.set_index(["Technology", "Year"])
+
+X_panel_full = sm.add_constant(
+    panel_indexed_full[["Weighted_Cited_Classes_Growth"]]
+)
+
+y_panel_full = panel_indexed_full["Technology_Growth"]
+
+model_panel_full = PanelOLS(
+    y_panel_full,
+    X_panel_full,
+    entity_effects=True,
+    check_rank=True,
+    drop_absorbed=True,
+)
+
+results_panel_full = model_panel_full.fit()
+
+print("\nPanel FE model, full sample:")
+print(results_panel_full)
+
+const_full = results_panel_full.params.get("const", 0.0)
+beta_full = results_panel_full.params["Weighted_Cited_Classes_Growth"]
+
+entity_effects_full = results_panel_full.estimated_effects
+entity_effects_full_df = entity_effects_full.groupby(level="Technology").first()
+entity_effects_full_df["TechnologyEffect"] = (
+    entity_effects_full_df["estimated_effects"] + const_full
+)
+
+entity_effects_full_df.to_csv("tables/panel_entity_effects_full_sample.csv")
+
+with open("tables/panel_fe_results_full_sample.txt", "w") as file:
+    file.write(str(results_panel_full))
+
+panel_results_table = pd.DataFrame({
+    "Coefficient": results_panel_full.params,
+    "Std. Error": results_panel_full.std_errors,
+    "t-stat": results_panel_full.tstats,
+    "p-value": results_panel_full.pvalues,
+})
+
+panel_results_table.to_csv("tables/panel_fe_results_full_sample.csv")
+panel_results_table.to_latex(
+    "tables/panel_fe_results_full_sample.tex",
+    float_format="%.4f",
+)
+
+
+# =============================================================================
+# Panel fixed-effects model: training sample for out-of-sample comparison
+# =============================================================================
+
+panel_train_data = all_technology_data[
+    all_technology_data["Year"] <= cutoff_training
+].copy()
+
+panel_indexed_train = panel_train_data.set_index(["Technology", "Year"])
+
+X_panel_train = sm.add_constant(
+    panel_indexed_train[["Weighted_Cited_Classes_Growth"]]
+)
+
+y_panel_train = panel_indexed_train["Technology_Growth"]
+
+model_panel_train = PanelOLS(
+    y_panel_train,
+    X_panel_train,
+    entity_effects=True,
+    check_rank=True,
+    drop_absorbed=True,
+)
+
+results_panel_train = model_panel_train.fit()
+
+print("\nPanel FE model, training sample:")
+print(results_panel_train)
+
+const_train = results_panel_train.params.get("const", 0.0)
+beta_train = results_panel_train.params["Weighted_Cited_Classes_Growth"]
+
+entity_effects_train = results_panel_train.estimated_effects
+entity_effects_train_df = entity_effects_train.groupby(level="Technology").first()
+
+with open("tables/panel_fe_results_training_sample.txt", "w") as file:
+    file.write(str(results_panel_train))
+
+
+# =============================================================================
+# Marginal effects using the panel/global beta
+# =============================================================================
+
+technology_share_df = all_technology_data[
+    all_technology_data["Year"] == margineffect_year - 1
+][["Technology", "Technology_Share"]].copy()
+
+marginresult_rows = []
+
+for margin_cpc_class in margincitframe["Cited Technology Class"].dropna().unique():
+    margincitframe_process = margincitframe[
+        margincitframe["Cited Technology Class"] == margin_cpc_class
+    ].copy()
+
+    margineffect_temp = pd.merge(
+        technology_share_df,
+        margincitframe_process,
+        how="left",
+        on="Technology",
+    )
+
+    margineffect_temp["Normalized citations"] = (
+        margineffect_temp["Normalized citations"]
+        .fillna(0)
+    )
+
+    margineffect_temp["Marginaleffect_GlobalBeta"] = (
+        beta_full
+        * margineffect_temp["Technology_Share"]
+        * margineffect_temp["Normalized citations"]
+    )
+
+    marginresult_rows.append(margineffect_temp)
+
+if marginresult_rows:
+    marginresults = pd.concat(marginresult_rows, ignore_index=True)
+
+    marginresults_listed_global = (
+        marginresults
+        .groupby("Cited Technology Class")["Marginaleffect_GlobalBeta"]
+        .sum()
+        .reset_index()
+        .sort_values(by="Marginaleffect_GlobalBeta", ascending=False)
+    )
+
+    marginresults_listed_global.to_csv(
+        "tables/marginal_effects_global_beta.csv",
+        index=False,
+    )
+
+    print("\nTop 20 marginal effects:")
+    print(marginresults_listed_global.head(20))
+
+    plt.figure(figsize=(10, 6))
+
+    sns.histplot(
+        data=marginresults_listed_global,
+        x="Marginaleffect_GlobalBeta",
+        bins=100,
+    )
+
+    plt.yscale("log")
+    plt.xlabel("Marginal effect")
+    plt.ylabel("Frequency, log scale")
+    plt.title("Distribution of Marginal Effects")
+    plt.tight_layout()
+    plt.savefig(
+        "plots/marginal_effects/marginaleffects_global.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+
+# =============================================================================
+# Forecast cited CPC class growth rates to 2030
+# =============================================================================
+
+citedtechnologies_growthforecast = filled_df[
+    ["Class", "Year", f"Growth_Rate_{x}_Years"]
+].copy()
+
+citedtechnologies_growthforecast[f"Growth_Rate_{x}_Years"] = clean_numeric(
+    citedtechnologies_growthforecast[f"Growth_Rate_{x}_Years"]
+)
+
+citedtechnologies_growthforecast = (
+    citedtechnologies_growthforecast
+    .replace([np.inf, -np.inf], np.nan)
+    .dropna()
+)
+
+citedtechnologies_growthforecast = citedtechnologies_growthforecast[
+    citedtechnologies_growthforecast["Year"] >= estimation_year_start
+].copy()
+
+forecasted_frames = []
+
+for forecast_cpcclass in citedtechnologies_growthforecast["Class"].unique():
+    cpc_df = citedtechnologies_growthforecast[
+        citedtechnologies_growthforecast["Class"] == forecast_cpcclass
+    ].copy()
+
+    cpc_df = cpc_df.sort_values("Year")
+
+    if len(cpc_df) < 5:
+        continue
+
+    X_lr = cpc_df["Year"].values.reshape(-1, 1)
+    y_lr = cpc_df[f"Growth_Rate_{x}_Years"].values
+
+    lr_model = LinearRegression().fit(X_lr, y_lr)
+
+    last_observed_year = int(cpc_df["Year"].max())
+    forecast_years = list(range(last_observed_year + 1, extended_forecast_end_year + 1))
+
+    if forecast_years:
+        forecasted_growth_rates = lr_model.predict(
+            np.array(forecast_years).reshape(-1, 1)
+        )
+
+        forecast_df = pd.DataFrame({
+            "Class": forecast_cpcclass,
+            "Year": forecast_years,
+            f"Growth_Rate_{x}_Years": forecasted_growth_rates,
+        })
+
+        forecasted_frames.append(pd.concat([cpc_df, forecast_df], ignore_index=True))
+
+    else:
+        forecasted_frames.append(cpc_df)
+
+forecasted_df = pd.concat(forecasted_frames, ignore_index=True)
+forecasted_df.to_csv("data_output/forecasted_cpc_growth_to_2030.csv", index=False)
+
+
+# =============================================================================
+# Forecast comparison: Panel FE vs. ARIMA vs. Random Walk
+# =============================================================================
+
+technologies_iter = all_technology_data["Technology"].unique()
+
+rmse_rows = []
+best_model_per_technology = []
+unconditional_panel_forecast_2030_sums = []
+extended_forecast_rows = []
+arima_param_frames = []
+
+for tech in technologies_iter:
+    tech_data = (
+        all_technology_data[all_technology_data["Technology"] == tech]
+        .sort_values("Year")
+        .copy()
+    )
+
+    train_data = tech_data[tech_data["Year"] <= cutoff_training].copy()
+
+    test_data = tech_data[
+        (tech_data["Year"] > cutoff_training)
+        & (tech_data["Year"] <= forecast_end_year)
+    ].copy()
+
+    if train_data.empty or test_data.empty:
+        print(f"Skipping forecast comparison for {tech}: insufficient data.")
+        continue
+
+    if tech not in entity_effects_train_df.index:
+        print(f"Skipping forecast comparison for {tech}: no training fixed effect.")
+        continue
+
+    y_train = train_data["Technology_Growth"].values
+    y_test = test_data["Technology_Growth"].values
+
+    future_years = test_data["Year"].values
+    forecast_steps = len(future_years)
+
+    future_years_extended = np.arange(
+        forecast_end_year + 1,
+        extended_forecast_end_year + 1,
+    )
+
+    extended_forecast_steps = len(future_years_extended)
+
+    # -------------------------------------------------------------------------
+    # Panel FE forecast for the test period
+    # -------------------------------------------------------------------------
+
+    entity_effect_train_tech = entity_effects_train_df.loc[tech, "estimated_effects"]
+
+    panel_forecast_test = (
+        entity_effect_train_tech
+        + const_train
+        + beta_train * test_data["Weighted_Cited_Classes_Growth"].values
+    )
+
+    rmse_panel = np.sqrt(mean_squared_error(y_test, panel_forecast_test))
+
+    # -------------------------------------------------------------------------
+    # Panel in-sample diagnostic plot
+    # -------------------------------------------------------------------------
+
+    try:
+        panel_fitted_train = (
+            results_panel_train
+            .fitted_values
+            .loc[tech]["fitted_values"]
+            .values
+        )
+
+        panel_fit_plot_df = pd.concat(
+            [
+                pd.DataFrame({
+                    "Year": train_data["Year"].values,
+                    "Value": train_data["Technology_Growth"].values,
+                    "Series": "Actual",
+                }),
+                pd.DataFrame({
+                    "Year": train_data["Year"].values,
+                    "Value": panel_fitted_train,
+                    "Series": "Panel FE fitted",
+                }),
+            ],
+            ignore_index=True,
+        )
+
+        save_long_lineplot(
+            plot_df=panel_fit_plot_df,
+            output_file=(
+                f"plots/forecast/panel_insample_fit/"
+                f"PanelInSampleFit_{tech}_{cutoff_training}.png"
+            ),
+            title=f"{tech}: Panel FE In-Sample Fit",
+            ylabel="Technology growth",
+        )
+
+    except Exception as error:
+        print(f"Could not create panel fitted-value plot for {tech}: {error}")
+
+    # -------------------------------------------------------------------------
+    # ARIMA benchmark for test period
+    # -------------------------------------------------------------------------
+
+    forecast_ARIMA_test, model_fit_test = safe_arima_forecast(
+        y_train,
+        forecast_steps,
+    )
+
+    if model_fit_test is not None:
+        try:
+            params = model_fit_test.params()
+            stderr = model_fit_test.bse()
+            pvalues = model_fit_test.pvalues()
+            order = model_fit_test.order
+            param_names = model_fit_test.arima_res_.param_names
+
+            arima_param_frames.append(pd.DataFrame({
+                "Parameter": param_names,
+                "Estimate": params,
+                "Std Error": stderr,
+                "p-value": pvalues,
+                "Technology": tech,
+                "ARIMA Order": [order] * len(params),
+            }))
+
+            fitted_values = model_fit_test.predict_in_sample()
+
+            arima_fit_plot_df = pd.concat(
+                [
+                    pd.DataFrame({
+                        "Year": train_data["Year"].values,
+                        "Value": y_train,
+                        "Series": "Actual",
+                    }),
+                    pd.DataFrame({
+                        "Year": train_data["Year"].values,
+                        "Value": fitted_values,
+                        "Series": "ARIMA fitted",
+                    }),
+                ],
+                ignore_index=True,
+            )
+
+            save_long_lineplot(
+                plot_df=arima_fit_plot_df,
+                output_file=(
+                    f"plots/forecast/arima_fit/"
+                    f"ARIMA_{tech}_{cutoff_training}_comparison.png"
+                ),
+                title=f"{tech}: ARIMA In-Sample Fit",
+                ylabel="Technology growth",
+            )
+
+        except Exception as error:
+            print(f"Could not save ARIMA diagnostics for {tech}: {error}")
+
+    rmse_arima = np.sqrt(mean_squared_error(y_test, forecast_ARIMA_test))
+
+    # -------------------------------------------------------------------------
+    # Random walk benchmark for test period
+    # -------------------------------------------------------------------------
+
+    forecast_RW_test = random_walk_forecast(y_train, forecast_steps)
+    rmse_rw = np.sqrt(mean_squared_error(y_test, forecast_RW_test))
+
+    candidates = {
+        "Panel FE": rmse_panel,
+        "ARIMA": rmse_arima,
+        "Random Walk": rmse_rw,
+    }
+
+    best_model = min(candidates, key=candidates.get)
+
+    rmse_rows.append({
+        "Technology": tech,
+        "RMSE_Panel": rmse_panel,
+        "RMSE_ARIMA": rmse_arima,
+        "RMSE_RandomWalk": rmse_rw,
+        "Best_Model": best_model,
+    })
+
+    best_model_per_technology.append((tech, best_model))
+
+    # -------------------------------------------------------------------------
+    # Test-period comparison plot
+    # -------------------------------------------------------------------------
+
+    comparison_plot_df = pd.concat(
+        [
+            pd.DataFrame({
+                "Year": tech_data[tech_data["Year"] <= forecast_end_year]["Year"].values,
+                "Value": tech_data[tech_data["Year"] <= forecast_end_year]["Technology_Growth"].values,
+                "Series": "Actual",
+            }),
+            pd.DataFrame({
+                "Year": future_years,
+                "Value": panel_forecast_test,
+                "Series": "Panel FE forecast",
+            }),
+            pd.DataFrame({
+                "Year": future_years,
+                "Value": forecast_ARIMA_test,
+                "Series": "ARIMA forecast",
+            }),
+            pd.DataFrame({
+                "Year": future_years,
+                "Value": forecast_RW_test,
+                "Series": "Random walk forecast",
+            }),
+        ],
+        ignore_index=True,
+    )
+
+    save_long_lineplot(
+        plot_df=comparison_plot_df,
+        output_file=(
+            f"plots/forecast/comparison_panel/"
+            f"ForecastComparison_Panel_ARIMA_RW_{tech}_{cutoff_training}.png"
+        ),
+        title=f"{tech}: Forecast Comparison",
+        ylabel="Technology growth",
+        vertical_lines=[(cutoff_training, "--")],
+    )
+
+    # -------------------------------------------------------------------------
+    # Extended forecasts, 2024–2030
+    # -------------------------------------------------------------------------
+
+    citationvector_unconditional = margincitframe[
+        margincitframe["Technology"] == tech
+    ].copy()
+
+    unconditional_anng = pd.merge(
+        citationvector_unconditional,
+        forecasted_df,
+        how="left",
+        left_on="Cited Technology Class",
+        right_on="Class",
+    )
+
+    unconditional_anng["Relativegrowth"] = (
+        unconditional_anng["Normalized citations"]
+        * unconditional_anng[f"Growth_Rate_{x}_Years"]
+    )
+
+    anng_forecasted_extended = []
+
+    for t_forecast in future_years_extended:
+        temp_anng = unconditional_anng[
+            unconditional_anng["Year"] == t_forecast
+        ]["Relativegrowth"].sum()
+
+        anng_forecasted_extended.append(temp_anng)
+
+    anng_forecasted_extended = np.array(anng_forecasted_extended, dtype=float)
+
+    if tech not in entity_effects_full_df.index:
+        print(f"Skipping extended panel forecast for {tech}: no full-sample fixed effect.")
+        continue
+
+    entity_effect_full_tech = entity_effects_full_df.loc[tech, "estimated_effects"]
+
+    panel_forecast_extended = (
+        entity_effect_full_tech
+        + const_full
+        + beta_full * anng_forecasted_extended
+    )
+
+    unconditional_panel_forecast_2030_sum = safe_compound_growth(
+        panel_forecast_extended
+    )
+
+    unconditional_panel_forecast_2030_sums.append(
+        (tech, unconditional_panel_forecast_2030_sum)
+    )
+
+    y_until_2023 = tech_data[
+        tech_data["Year"] <= forecast_end_year
+    ]["Technology_Growth"].values
+
+    forecast_ARIMA_extended, _ = safe_arima_forecast(
+        y_until_2023,
+        extended_forecast_steps,
+    )
+
+    forecast_RW_extended = random_walk_forecast(
+        y_until_2023,
+        extended_forecast_steps,
+    )
+
+    extended_forecast_rows.append({
+        "Technology": tech,
+        "Panel_Compound_Growth_2024_2030": safe_compound_growth(panel_forecast_extended),
+        "ARIMA_Compound_Growth_2024_2030": safe_compound_growth(forecast_ARIMA_extended),
+        "RandomWalk_Compound_Growth_2024_2030": safe_compound_growth(forecast_RW_extended),
+    })
+
+    extended_plot_df = pd.concat(
+        [
+            pd.DataFrame({
+                "Year": tech_data["Year"].values,
+                "Value": tech_data["Technology_Growth"].values,
+                "Series": "Actual",
+            }),
+            pd.DataFrame({
+                "Year": future_years_extended,
+                "Value": panel_forecast_extended,
+                "Series": "Panel FE forecast",
+            }),
+            pd.DataFrame({
+                "Year": future_years_extended,
+                "Value": forecast_ARIMA_extended,
+                "Series": "ARIMA forecast",
+            }),
+            pd.DataFrame({
+                "Year": future_years_extended,
+                "Value": forecast_RW_extended,
+                "Series": "Random walk forecast",
+            }),
+        ],
+        ignore_index=True,
+    )
+
+    save_long_lineplot(
+        plot_df=extended_plot_df,
+        output_file=(
+            f"plots/forecast/extended_panel/"
+            f"ExtendedForecast_Panel_ARIMA_RW_{tech}_{cutoff_training}_to_2030.png"
+        ),
+        title=f"{tech}: Extended Forecast to {extended_forecast_end_year}",
+        ylabel="Technology growth",
+        vertical_lines=[
+            (forecast_end_year, "--"),
+        ],
+    )
+
+
+# =============================================================================
+# Forecast summary
+# =============================================================================
+
+rmse_summary_df = pd.DataFrame(rmse_rows)
+rmse_summary_df.to_csv("tables/rmse_comparison.csv", index=False)
+
+if arima_param_frames:
+    arima_results_df = pd.concat(arima_param_frames, ignore_index=True)
+    arima_results_df.to_csv("tables/arima_parameters.csv", index=False)
+
+extended_forecasts_df = pd.DataFrame(extended_forecast_rows)
+extended_forecasts_df.to_csv(
+    "tables/extended_forecasts_2024_2030.csv",
+    index=False,
+)
+
+print("\nAverage RMSE:")
+print(
+    rmse_summary_df[
+        ["RMSE_Panel", "RMSE_ARIMA", "RMSE_RandomWalk"]
+    ].mean()
+)
+
+print(f"\nBest model per technology, out-of-sample train <= {cutoff_training}:")
+for tech, model in best_model_per_technology:
+    print(f"{tech}: {model}")
+
+print("\nUnconditional panel forecast, cumulative growth to 2030:")
+for tech, forecast_sum in unconditional_panel_forecast_2030_sums:
+    print(f"{tech}: {forecast_sum:.4f}")
+
+
+# =============================================================================
+# RMSE summary plots
+# =============================================================================
+
+if not rmse_summary_df.empty:
+    rmse_long = rmse_summary_df.melt(
+        id_vars="Technology",
+        value_vars=["RMSE_Panel", "RMSE_ARIMA", "RMSE_RandomWalk"],
+        var_name="Model",
+        value_name="RMSE",
+    )
+
+    rmse_long["Model"] = rmse_long["Model"].replace({
+        "RMSE_Panel": "Panel FE",
+        "RMSE_ARIMA": "ARIMA",
+        "RMSE_RandomWalk": "Random Walk",
+    })
+
+    plt.figure(figsize=(12, 7))
+
+    sns.barplot(
+        data=rmse_long,
+        x="RMSE",
+        y="Technology",
+        hue="Model",
+    )
+
+    plt.title("Forecast Accuracy by Technology")
+    plt.xlabel("RMSE")
+    plt.ylabel("")
+    plt.tight_layout()
+    plt.savefig(
+        "plots/analysis/rmse_comparison_panel_arima_randomwalk.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+    avg_rmse = (
+        rmse_long
+        .groupby("Model")["RMSE"]
+        .mean()
+        .reset_index()
+        .sort_values("RMSE")
+    )
+
+    plt.figure(figsize=(8, 5))
+
+    sns.barplot(
+        data=avg_rmse,
+        x="Model",
+        y="RMSE",
+    )
+
+    plt.title("Average Forecast Accuracy Across Technologies")
+    plt.xlabel("")
+    plt.ylabel("Average RMSE")
+    plt.tight_layout()
+    plt.savefig(
+        "plots/analysis/average_rmse_panel_arima_randomwalk.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+
+print("\nDone.")
